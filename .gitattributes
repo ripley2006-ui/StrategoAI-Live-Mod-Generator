@@ -1,2 +1,12 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+# Lege das Standardverhalten fest. Alle Textdateien sollten LF-Zeilenenden im Repository haben.
+* text=auto eol=lf
+
+# Definiere explizit Textdateien, die immer mit LF-Zeilenenden behandelt werden sollen.
+*.py text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.ini text eol=lf
+
+# Definiere Binärdateien, die Git nicht verändern soll (Beispiele).
+# *.png binary
+# *.jpg binary
