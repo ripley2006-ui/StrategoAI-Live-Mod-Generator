@@ -150,7 +150,59 @@ def _set_or_append_kv_block(existing: str, *, keys: Iterable[str], values: dict[
                 seen.add(k)
                 break
 
-    # Intentionally do not append missing keys here.
+    # Append missing keys at the end to ensure new parameters persist
+    missing = [k for k in values.keys() if k not in seen]
+    if missing:
+        # Ensure file ends with a newline
+        if lines and not lines[-1].endswith(("\r\n", "\n", "\r")):
+            lines[-1] = lines[-1] + ("\r\n" if "\r\n" in existing else "\n")
+        nl = "\r\n" if "\r\n" in existing else "\n"
+        for k in missing:
+            v = values.get(k, "")
+            lines.append(f"{k}={v}{nl}")
+    return "".join(lines)
+
+
+def _set_or_append_kv_in_global_header(existing: str, *, values: dict[str, str]) -> str:
+    """Replace or append key=value pairs only in the global header (before any section).
+
+    - Searches and replaces keys only until the first line that starts with '[' (a section header).
+    - Preserves formatting and EOLs.
+    - Appends missing keys at the end of the header block (just before the first section),
+      ensuring new parameters persist in the global area the UI edits.
+    """
+    if not values:
+        return existing
+
+    # Detect newline style from existing text
+    newline = "\r\n" if "\r\n" in existing else "\n"
+    lines = existing.splitlines(keepends=True)
+
+    # Find the boundary of the global header (first section header '[' at column 0, ignoring leading spaces)
+    header_end_idx = len(lines)
+    for i, ln in enumerate(lines):
+        if ln.lstrip().startswith("["):
+            header_end_idx = i
+            break
+
+    key_res: dict[str, re.Pattern[str]] = {
+        k: re.compile(rf"^(?P<prefix>\s*)(?P<key>(?i:{re.escape(k)}))(?P<sep>\s*=\s*)(?P<val>.*?)(?P<eol>(\r\n|\n|\r)?)$")
+        for k in values.keys()
+    }
+
+    seen: set[str] = set()
+    for i in range(header_end_idx):
+        ln = lines[i]
+        if ln.lstrip().startswith((';', '#')): continue
+        for k, rx in key_res.items():
+            m = rx.match(ln)
+            if m:
+                new_val = values.get(k, "")
+                lines[i] = f"{m.group('prefix')}{m.group('key')}{m.group('sep')}{new_val}{m.group('eol') or newline}"
+                seen.add(k)
+                break
+
+    # This function intentionally does not append missing keys to prevent layout changes.
     return "".join(lines)
 
 
@@ -211,38 +263,85 @@ def _write_user_info_to_work(values: dict[str, str]) -> None:
 
 
 def read_ini_values(keys: Sequence[str]) -> dict[str, str]:
-    """Read arbitrary key=value pairs from work.ini without changing layout.
+    """Read arbitrary key=value pairs from [Global] section only.
 
     Returns a dict for the requested keys. Missing keys map to "".
+    Only reads from [Global] section to avoid conflicts with mission-specific parameters.
     """
     text = _read_text(_work_ini_path())
     result: dict[str, str] = {k: "" for k in keys}
     if not text:
         return result
-    lines = text.splitlines()
+
+    # Extract [Global] section only
+    start_idx = text.find("[Global]")
+    if start_idx < 0:
+        return result
+
+    # Find end of [Global] section (next section starting with '[')
+    rest = text[start_idx + len("[Global]"):]
+    end_idx = rest.find("\n[")
+    if end_idx >= 0:
+        block = rest[:end_idx]
+    else:
+        block = rest
+
+    lines = block.splitlines()
+    # Allow leading whitespace, and ignore commented lines starting with ';' or '#'
+    # Use inline (?i:...) for case-insensitive key match only
     patterns: dict[str, re.Pattern[str]] = {
-        k: re.compile(rf"^(?i:{re.escape(k)})\s*=\s*(.*)$") for k in keys
+        k: re.compile(rf"^\s*(?![;#])(?i:{re.escape(k)})\s*=\s*(.*)$") for k in keys
     }
     for line in lines:
         for k, pat in patterns.items():
             m = pat.match(line)
             if m:
-                result[k] = m.group(1)
+                # Strip inline comments
+                val = m.group(1).split(";", 1)[0].split("#", 1)[0].strip()
+                result[k] = val
     return result
 
 
 def write_ini_values(values: dict[str, str]) -> None:
-    """Write arbitrary key=value pairs into work.ini preserving layout.
+    """Write arbitrary key=value pairs into [Global] section only.
 
-    Only replaces the value part after '=' for keys that already exist.
-    Does not append missing keys to avoid layout drift.
+    Only replaces the value part after '=' for keys that already exist in [Global].
+    Appends missing keys at the end of [Global] section to ensure new parameters persist.
     """
     if not values:
         return
     work_path = _work_ini_path()
     _seed_work_ini_from_template_if_missing()
     current = _read_text(work_path)
-    updated = _set_or_append_kv_block(current, keys=values.keys(), values=values)
+
+    # Find [Global] section
+    start_idx = current.find("[Global]")
+    if start_idx < 0:
+        # No [Global] section found - cannot write
+        return
+
+    # Find end of [Global] section (next section starting with '[')
+    rest_start = start_idx + len("[Global]")
+    rest = current[rest_start:]
+    end_match = rest.find("\n[")
+
+    if end_match >= 0:
+        # Found next section
+        end_idx = rest_start + end_match
+        global_block = current[start_idx:end_idx]
+        after_global = current[end_idx:]
+    else:
+        # [Global] is the last section
+        global_block = current[start_idx:]
+        after_global = ""
+
+    # Update values in [Global] section only
+    updated_block = _set_or_append_kv_block(global_block, keys=values.keys(), values=values)
+
+    # Reconstruct file
+    before_global = current[:start_idx]
+    updated = before_global + updated_block + after_global
+
     _write_text(work_path, updated)
     _publish_work_ini_changed()
 
@@ -258,15 +357,30 @@ _KEY_LINE_RX = re.compile(
 
 
 def read_keys_with_comment_state(keys: Sequence[str]) -> dict[str, Tuple[bool, str]]:
-    """Return {key: (enabled, value)} for given keys from work.ini.
+    """Return {key: (enabled, value)} for given keys from [Global] section only.
 
     enabled = True if line is not commented (no leading ';' before key), False otherwise.
+    Only reads from [Global] section to avoid conflicts with mission-specific parameters.
     """
     text = _read_text(_work_ini_path())
     if not text:
         return {k: (False, "") for k in keys}
+
+    # Extract [Global] section only
+    start_idx = text.find("[Global]")
+    if start_idx < 0:
+        return {k: (False, "") for k in keys}
+
+    # Find end of [Global] section (next section starting with '[')
+    rest = text[start_idx + len("[Global]"):]
+    end_idx = rest.find("\n[")
+    if end_idx >= 0:
+        block = rest[:end_idx]
+    else:
+        block = rest
+
     result: dict[str, Tuple[bool, str]] = {k: (False, "") for k in keys}
-    for line in text.splitlines(keepends=False):
+    for line in block.splitlines(keepends=False):
         m = _KEY_LINE_RX.match(line)
         if not m:
             continue
@@ -280,17 +394,40 @@ def read_keys_with_comment_state(keys: Sequence[str]) -> dict[str, Tuple[bool, s
 
 
 def write_keys_with_comment_state(settings: dict[str, Tuple[bool, str]]) -> None:
-    """Write values and comment state for keys in work.ini, preserving layout.
+    """Write values and comment state for keys in [Global] section only.
 
     If enabled is False, ensure a ';' appears before the key (commented line).
     If enabled is True, remove leading ';' before the key.
+    Only writes to [Global] section to avoid conflicts with mission-specific parameters.
     """
     path = _work_ini_path()
     _seed_work_ini_from_template_if_missing()
     text = _read_text(path)
     if not text:
         return
-    lines = text.splitlines(keepends=True)
+
+    # Find [Global] section
+    start_idx = text.find("[Global]")
+    if start_idx < 0:
+        return
+
+    # Find end of [Global] section (next section starting with '[')
+    rest_start = start_idx + len("[Global]")
+    rest = text[rest_start:]
+    end_match = rest.find("\n[")
+
+    if end_match >= 0:
+        # Found next section
+        end_idx = rest_start + end_match
+        global_block = text[start_idx:end_idx]
+        after_global = text[end_idx:]
+    else:
+        # [Global] is the last section
+        global_block = text[start_idx:]
+        after_global = ""
+
+    # Update lines in [Global] section only
+    lines = global_block.splitlines(keepends=True)
     key_set = set(settings.keys())
     for i, line in enumerate(lines):
         m = _KEY_LINE_RX.match(line)
@@ -305,7 +442,12 @@ def write_keys_with_comment_state(settings: dict[str, Tuple[bool, str]]) -> None
         # Build explicit prefix: add '; ' when disabled, nothing when enabled
         prefix = '' if enabled else '; '
         lines[i] = f"{prefix}{key}={value}{eol}"
-    _write_text(path, "".join(lines))
+
+    # Reconstruct file
+    before_global = text[:start_idx]
+    updated = before_global + "".join(lines) + after_global
+
+    _write_text(path, updated)
     _publish_work_ini_changed()
 
 
@@ -954,27 +1096,46 @@ def _update_gameplay_tag_list(text: str, tag_value: str) -> str:
 def apply_modname_mappings(modname: str, version: str | None = None, date_str: str | None = None, notes_text: str | None = None) -> None:
     """Apply Modname-derived mappings to [Info] and GameplayTags and mirror.
 
-    Policy change:
-    - Keep DifficultyGameplayTag/GameplayTagList stable across Modname edits.
-    - Only generate a new code (prefix+number) when no mapping exists yet,
-      i.e., after "Clean all" or "Uninstall" which remove the mirror file.
+    Policy:
+    - When modname changes: increment CodeNumber by +1 (not new random number)
+    - When difficulty changes: generate new random code (via _purge_mapping_keys_from_mirror)
+    - After Clean All or Uninstall: generate new random code (mirror deleted)
 
     Always update readable fields (DifficultyNameKey, DifficultySubtextKey,
     DifficultyFlavorKey) from the current inputs.
     """
-    # Try to reuse existing mapping from mirror (stable across Modname changes)
+    # Read existing mapping from mirror
     mirror = _read_mirror_dict()
     existing_tag = mirror.get("GameplayTag") or mirror.get("DifficultyGameplayTag")
-    if existing_tag:
+
+    # Get last stored modname to detect changes
+    last_modname = mirror.get("UI_Modname", "")
+    modname_changed = (last_modname != modname) and last_modname != ""
+
+    if existing_tag and not modname_changed:
+        # Modname unchanged: reuse existing tag
         tag_value = existing_tag
-        # Derive prefix/number for mirror consistency if present
         prefix = mirror.get("CodePrefix", "")
         try:
             number = int(mirror.get("CodeNumber", "0") or 0)
         except Exception:
             number = 0
+    elif existing_tag and modname_changed:
+        # Modname changed: increment CodeNumber by +1
+        prefix = mirror.get("CodePrefix", "")
+        try:
+            number = int(mirror.get("CodeNumber", "0") or 0)
+            number = number + 1  # Increment by 1
+            if number > 999:  # Wrap around if exceeds 999
+                number = 1
+        except Exception:
+            # If parsing fails, generate new code
+            prefix, number = _generate_code_for_modname(modname)
+        difficulty = get_current_difficulty_from_work()
+        root = _difficulty_tag_root(difficulty)
+        tag_value = f"{root}{prefix}{number}"
     else:
-        # First run (or after Clean/Uninstall): generate new code
+        # First run (or after Clean/Uninstall): generate new random code
         prefix, number = _generate_code_for_modname(modname)
         difficulty = get_current_difficulty_from_work()
         root = _difficulty_tag_root(difficulty)
@@ -1008,6 +1169,8 @@ def apply_modname_mappings(modname: str, version: str | None = None, date_str: s
         "DifficultySubtextKey": _build_subtext_value(display_name, notes_text),
         "DifficultyGameplayTag": tag_value,
         "GameplayTag": tag_value,
+        # CRITICAL: Store current modname so next call can detect changes
+        "UI_Modname": modname,
     }
     if prefix:
         mm["CodePrefix"] = prefix
@@ -1092,36 +1255,8 @@ class _WriteWorker:
             t.join(timeout=0.5)
 
     def enqueue_user_info(self, values: dict[str, str], *, write_work: bool, write_mirror: bool) -> None:
-        # Apply Modname mappings for work.ini when requested
-        try:
-            if write_work:
-                mod = ""
-                ver = ""
-                dt = ""
-                nt = ""
-                for k, v in (values or {}).items():
-                    if str(k).lower() == "modname":
-                        mod = str(v)
-                        # do not break; also probe for version
-                        continue
-                    
-                for k, v in (values or {}).items():
-                    if str(k).lower() == "version":
-                        ver = str(v)
-                        break
-                for k, v in (values or {}).items():
-                    if str(k).lower() == "date":
-                        dt = str(v)
-                        break
-                for k, v in (values or {}).items():
-                    if str(k).lower() == "notes":
-                        nt = str(v)
-                        break
-                if mod:
-                    apply_modname_mappings(mod, ver, dt, nt)
-        except Exception:
-            pass
-        # Persist UI fields into mirror under UI_* keys (no legacy writes to INI)
+        # CRITICAL: Write UI_Modname to mirror FIRST before apply_modname_mappings reads it!
+        # This ensures modname change detection works correctly.
         try:
             if write_mirror:
                 ui_vals: dict[str, str] = {}
@@ -1139,6 +1274,37 @@ class _WriteWorker:
                     # Do not persist template in mirror
                 if ui_vals:
                     _write_mirror_merge(ui_vals)
+        except Exception:
+            pass
+
+        # Apply Modname mappings for work.ini when requested
+        # This reads UI_Modname from mirror to detect changes
+        try:
+            if write_work:
+                mod = ""
+                ver = ""
+                dt = ""
+                nt = ""
+                for k, v in (values or {}).items():
+                    if str(k).lower() == "modname":
+                        mod = str(v)
+                        # do not break; also probe for version
+                        continue
+
+                for k, v in (values or {}).items():
+                    if str(k).lower() == "version":
+                        ver = str(v)
+                        break
+                for k, v in (values or {}).items():
+                    if str(k).lower() == "date":
+                        dt = str(v)
+                        break
+                for k, v in (values or {}).items():
+                    if str(k).lower() == "notes":
+                        nt = str(v)
+                        break
+                if mod:
+                    apply_modname_mappings(mod, ver, dt, nt)
         except Exception:
             pass
 

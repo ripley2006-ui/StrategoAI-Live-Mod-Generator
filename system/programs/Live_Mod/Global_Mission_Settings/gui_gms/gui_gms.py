@@ -1236,18 +1236,15 @@ class GlobalMissionSettingsApp:
             )
             return
 
-        # Activate category and start at first page of that category
+        # Activate category and force start at first page of that category
         self._set_active_category(category)
-        
-        # Find the index of the first entry in this category
+
+        # Always show page 1 of the filtered category
+        self.page_index = 0
+
+        # Find the index of the first entry in this category (global index for focusing)
         index = self.category_positions.get(category)
-        if index is not None:
-            # Calculate the page this index falls on
-            self.page_index = index // self.entries_per_page if self.entries_per_page > 0 else 0
-            self.pending_entry_index = index
-        else:
-            self.page_index = 0
-            self.pending_entry_index = None
+        self.pending_entry_index = index if index is not None else None
         # default focus to left side
         self.last_selected_side = "left"
         # refresh filtered view (now limited to this category) and show page 1
@@ -1756,7 +1753,8 @@ class GlobalMissionSettingsApp:
         except Exception:
             values = {}
         for entry in entries:
-            k = self._label_to_ini_key(entry.label)
+            # Use the same key resolution as when writing: prefer explicit ini_key
+            k = getattr(entry, 'ini_key', None) or self._label_to_ini_key(entry.label)
             if k in values and values[k] != "":
                 try:
                     entry.value = values[k]  # type: ignore[attr-defined]
@@ -1823,14 +1821,19 @@ class GlobalMissionSettingsApp:
                 except ValueError:
                     continue
                 key = key.strip()
+                # Remove leading semicolon (commented lines) before checking against multiplayer_keys
+                key_normalized = key.lstrip(';').strip()
                 # take raw value (left side of inline comment)
                 val = val.split(";", 1)[0].split("#", 1)[0].strip()
                 # Skip obviously non-parameter lines
-                if not key:
+                if not key_normalized:
                     continue
                 # Skip multiplayer keys from main list; handled in separate view
-                if key in multiplayer_keys:
+                # Use normalized key (without semicolon) for comparison
+                if key_normalized in multiplayer_keys:
                     continue
+                # Use normalized key for display
+                key = key_normalized
                 # Store display label prettified, but keep original ini key on the model
                 display = self._pretty_label_from_key(key)
                 pe = ParameterEntry(display, val, current_cat)
@@ -1909,7 +1912,14 @@ class GlobalMissionSettingsApp:
             stat = path.stat()
             mtime = stat.st_mtime
             if self._last_work_mtime is None or mtime > self._last_work_mtime:
+                # CRITICAL: Update mtime BEFORE any processing to prevent infinite reload loops
+                # If we return early during editing, we still need to mark this mtime as "seen"
                 self._last_work_mtime = mtime
+
+                # Skip refresh entirely if currently editing (but mtime was already updated above)
+                if self._editing_in_progress:
+                    return
+
                 # Refresh fields from file
                 try:
                     # Check if we need a FULL rebuild (Clean All, Template load, etc.)
@@ -1942,17 +1952,13 @@ class GlobalMissionSettingsApp:
                         # Reset the flag
                         self._force_full_rebuild = False
                         return
-                    
-                    # Skip refresh entirely if currently editing (small change)
-                    if self._editing_in_progress:
-                        return
-                    
+
                     # Small change: only reload VALUES without rebuilding structure
                     try:
                         self._load_parameters_from_work_ini()
                     except Exception:
                         pass
-                    
+
                     # Update only the visible values in the tree without rebuilding
                     try:
                         self._update_tree_values_only()
@@ -2058,13 +2064,7 @@ class GlobalMissionSettingsApp:
             entry.destroy()
         except Exception:
             pass
-        finally:
-            self._value_editor = None  # type: ignore[attr-defined]
-            # CRITICAL: Keep the editing flag True for 2 seconds after saving
-            # to prevent the file watcher from refreshing the view
-            def _clear_editing_flag():
-                self._editing_in_progress = False
-            self.root.after(2000, _clear_editing_flag)
+        self._finalize_edit(next_target)
         
         # NOW move to next cell after the widget is destroyed
         # Use a small delay to ensure the destroy is complete
@@ -2074,6 +2074,23 @@ class GlobalMissionSettingsApp:
         
         # CRITICAL: Return 'break' to stop Tab propagation to other widgets
         return "break"
+
+    def _finalize_edit(self, next_target: tuple[str, str] | None = None) -> None:
+        """Finalizes the editing process, clears flags, and moves to the next cell if specified."""
+        self._value_editor = None  # type: ignore[attr-defined]
+
+        # Keep the editing flag True for a short duration to prevent the file watcher
+        # from causing a disruptive refresh immediately after a save.
+        def _clear_editing_flag():
+            self._editing_in_progress = False
+
+        self.root.after(1500, _clear_editing_flag)
+
+        # If a next target is specified (from Tab navigation), move to it.
+        # This is done after a short delay to ensure the UI has processed the destruction
+        # of the previous editor widget.
+        if next_target:
+            self.root.after(10, lambda: self._navigate_to_cell(*next_target))
 
     def _calculate_next_cell(self, item_id: str, side: str, *, mode: str) -> tuple[str, str] | None:
         """Calculate which cell should be next, without navigating there.
@@ -2200,15 +2217,34 @@ class GlobalMissionSettingsApp:
         except Exception:
             pass
 
-        entry = ttk.Entry(self.parameter_tree, style="GMS.ValueEdit.TEntry", justify="center")
-        # Ensure exact same font as the table view regardless of theme quirks
+        # Use a minimal, borderless Entry that visually blends into the cell
+        # This avoids the feeling that a big input box appears on click
+        row_tags = ()
+        try:
+            row_tags = tuple(self.parameter_tree.item(item_id, 'tags') or ())
+        except Exception:
+            row_tags = ()
+        cell_bg = self.palette.get('tree_alt_bg') if ('odd' in row_tags) else self.palette.get('tree_bg')
+        entry = tk.Entry(
+            self.parameter_tree,
+            bg=cell_bg,
+            fg=self.palette.get('tree_fg'),
+            insertbackground=self.palette.get('tree_fg'),
+            borderwidth=0,
+            highlightthickness=0,
+            relief=tk.FLAT,
+            justify="center",
+        )
         try:
             entry.configure(font=self.fonts.get("tree", self.fonts["entry"]))
         except Exception:
             pass
         entry.insert(0, current)
         entry.icursor(tk.END)
-        entry.focus_set()
+        try:
+            entry.focus_set()
+        except Exception:
+            pass
         entry.place(x=x, y=y, width=w, height=h)
 
         def commit(_evt: tk.Event | None = None) -> None:
@@ -2231,6 +2267,8 @@ class GlobalMissionSettingsApp:
                     ini_key = getattr(model, 'ini_key', None) or self._label_to_ini_key(getattr(model, 'label', ''))
                     if ini_key:
                         write_ini_values({ini_key: new_val})
+                        # Don't reload immediately - let the editing flag protect the value
+                        # The file watcher will update when editing_in_progress becomes False
                 except Exception:
                     pass
             try:
@@ -2242,15 +2280,8 @@ class GlobalMissionSettingsApp:
                 entry.unbind("<Escape>")
                 entry.unbind("<FocusOut>")
                 entry.destroy()
-            except Exception:
-                pass
             finally:
-                self._value_editor = None  # type: ignore[attr-defined]
-                # CRITICAL: Keep the editing flag True for 2 seconds after saving
-                # to prevent the file watcher from refreshing the view
-                def _clear_editing_flag():
-                    self._editing_in_progress = False
-                self.root.after(2000, _clear_editing_flag)
+                self._finalize_edit()
 
         def cancel(_evt: tk.Event | None = None) -> None:
             try:
@@ -2275,6 +2306,20 @@ class GlobalMissionSettingsApp:
         ]
         selected = {v.strip() for v in (current or '').split(',') if v.strip()}
         win = tk.Toplevel(self.parameter_tree)
+        # Track as active editor and ensure navigation works after close
+        try:
+            self._value_editor = win  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        def _bone_popup_closed(_e=None):
+            try:
+                self._value_editor = None  # type: ignore[attr-defined]
+            except Exception:
+                self._finalize_edit()
+        try:
+            win.bind("<Destroy>", _bone_popup_closed, add=True)
+        except Exception:
+            pass
         try:
             win.configure(bg=self.palette.get("panel_dark", "#2a2d33"))
         except Exception:
@@ -2339,8 +2384,8 @@ class GlobalMissionSettingsApp:
                     pass
             try:
                 win.destroy()
-            except Exception:
-                pass
+            finally:
+                _bone_popup_closed()
         btns = ttk.Frame(frame, style="GMS.TFrame")
         btns.grid(row=r+1, column=0, columnspan=4, sticky="e", pady=(8, 0))
         ttk.Button(btns, text="OK", style="GMS.Green.TButton", command=apply_close).grid(row=0, column=0)
@@ -2348,6 +2393,25 @@ class GlobalMissionSettingsApp:
 
     def _open_bool_popup(self, item_id: str, side: str, current_bool: str, x: int, y: int, w: int, h: int, key_guess: str | None) -> None:
         win = tk.Toplevel(self.parameter_tree)
+        self._editing_in_progress = True
+        # Track as active editor and ensure navigation works after close
+        try:
+            self._value_editor = win  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        def _bool_popup_closed(_e=None):
+            try:
+                self._value_editor = None  # type: ignore[attr-defined]
+                # Keep editing flag True for a short duration to prevent file watcher
+                # from reloading immediately after save
+                def _clear_editing_flag():
+                    self._editing_in_progress = False
+                self.root.after(1500, _clear_editing_flag)
+            except Exception: pass
+        try:
+            win.bind("<Destroy>", _bool_popup_closed, add=True)
+        except Exception:
+            pass
         try:
             win.configure(bg=self.palette.get("panel_dark", "#2a2d33"))
         except Exception:
@@ -2374,12 +2438,11 @@ class GlobalMissionSettingsApp:
                     key = (getattr(model, 'ini_key', None) or key_guess or self._label_to_ini_key(getattr(model, 'label', '')))
                     if key:
                         write_ini_values({key: val})
+                        # Don't reload immediately - let the editing flag protect the value
+                        # The file watcher will update when editing_in_progress becomes False
                 except Exception:
-                    pass
-            try:
-                win.destroy()
-            except Exception:
-                pass
+                    pass # ignore write errors
+            win.destroy()
         # Highlight current value in green
         cur_is_true = (str(current_bool).strip().lower() == 'true')
         true_style = "GMS.Green.TButton" if cur_is_true else "GMS.Gray.TButton"
@@ -2391,8 +2454,27 @@ class GlobalMissionSettingsApp:
 
     def _open_traptype_popup(self, item_id: str, side: str, current: str, x: int, y: int, w: int, h: int) -> None:
         options = ["Explosive", "Flashbang", "Alarm"]
+        self._editing_in_progress = True
         selected = {v.strip() for v in (current or '').split(',') if v.strip()}
         win = tk.Toplevel(self.parameter_tree)
+        # Track as active editor and ensure navigation works after close
+        try:
+            self._value_editor = win  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        def _trap_popup_closed(_e=None):
+            try:
+                self._value_editor = None  # type: ignore[attr-defined]
+                # Keep editing flag True for a short duration to prevent file watcher
+                # from reloading immediately after save
+                def _clear_editing_flag():
+                    self._editing_in_progress = False
+                self.root.after(1500, _clear_editing_flag)
+            except Exception: pass
+        try:
+            win.bind("<Destroy>", _trap_popup_closed, add=True)
+        except Exception:
+            pass
         try:
             win.configure(bg=self.palette.get("panel_dark", "#2a2d33"))
         except Exception:
@@ -2446,16 +2528,14 @@ class GlobalMissionSettingsApp:
                     key = getattr(model, 'ini_key', None) or self._label_to_ini_key(getattr(model, 'label', ''))
                     if key:
                         write_ini_values({key: val})
-                except Exception:
-                    pass
-            try:
-                win.destroy()
-            except Exception:
-                pass
+                        # Don't reload immediately - let the editing flag protect the value
+                        # The file watcher will update when editing_in_progress becomes False
+                except Exception: pass
+            win.destroy()
         btns = ttk.Frame(frame, style="GMS.TFrame")
-        btns.grid(row=len(options), column=0, sticky="e", pady=(8, 0))
+        btns.grid(row=len(options), column=0, columnspan=2, sticky="e", pady=(8, 0))
         ttk.Button(btns, text="OK", style="GMS.Green.TButton", command=apply_close).grid(row=0, column=0)
-        ttk.Button(btns, text="Cancel", style="GMS.Gray.TButton", command=win.destroy).grid(row=0, column=1, padx=(6, 0))
+        ttk.Button(btns, text="Cancel", style="GMS.Gray.TButton", command=lambda: (win.destroy(), _trap_popup_closed())).grid(row=0, column=1, padx=(6, 0))
 
     def _move_to_next_cell(self, item_id: str, side: str, *, mode: str) -> None:
         if not self.parameter_tree:

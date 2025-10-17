@@ -93,6 +93,8 @@ class BaseCardGUI:
         self.pages = 9
 
         self.card_widgets: Dict[str, Dict[str, tk.Entry]] = {}
+        # Remember last selected template per mission so the dropdown keeps selection
+        self._last_template_choice: Dict[str, str] = {}
         
         # Marquee state for individual parameter labels
         self._param_marquee_job: str | None = None
@@ -746,7 +748,15 @@ class BaseCardGUI:
 
         options = ["Select a template..."] + get_available_templates()
         cb = ttk.Combobox(template_row, state="readonly", values=options, style="MS.TCombobox", width=20)
-        cb.current(0)
+        # Restore previously chosen template for this mission, if any
+        try:
+            prev = self._last_template_choice.get(mission.section)
+            if prev and prev in options:
+                cb.set(prev)
+            else:
+                cb.current(0)
+        except Exception:
+            cb.current(0)
         cb.bind("<<ComboboxSelected>>", lambda _e, m=mission, cbox=cb: self._on_grab_template(m, cbox))
         cb.pack(side=tk.LEFT, padx=(8, 0), fill=tk.X, expand=True)
 
@@ -1039,6 +1049,11 @@ class BaseCardGUI:
             cbox.current(0)
             return
         try:
+            # Persist the user's choice so it remains visible and can be restored
+            try:
+                self._last_template_choice[mission.section] = choice
+            except Exception:
+                pass
             from system.programs.Live_Mod.Global_Mission_Settings.config_gms.gms_actions import _find_template_path
             tpl_path = _find_template_path(choice)
             if not tpl_path or not tpl_path.exists():
@@ -1087,13 +1102,6 @@ class BaseCardGUI:
                 # Fallback to per-key writes if batch fails
                 for key, value in updates.items():
                     write_mission_parameter(mission.section, key, value)
-
-            # Reset dropdown selection before triggering a UI rebuild
-            try:
-                if cbox.winfo_exists():
-                    cbox.current(0)
-            except Exception:
-                pass
 
             # Schedule refresh in main loop to avoid operating on destroyed widgets
             try:

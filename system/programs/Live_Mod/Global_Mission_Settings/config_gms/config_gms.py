@@ -17,13 +17,27 @@ LEFT_PANEL_RATIO = 0.33
 ROWS_PER_PAGE = 19
 
 
-@dataclass(frozen=True)
+@dataclass
 class ParameterEntry:
-    """Represents an individual editable mission parameter."""
+    """Represents an individual editable mission parameter.
+
+    The value field is mutable while label and category are used for hashing.
+    This allows the entry to be used as a dictionary key while its value can change.
+    """
 
     label: str
     value: str
     category: str
+
+    def __hash__(self):
+        """Hash based only on label and category, not value."""
+        return hash((self.label, self.category))
+
+    def __eq__(self, other):
+        """Equality based only on label and category, not value."""
+        if not isinstance(other, ParameterEntry):
+            return False
+        return self.label == other.label and self.category == other.category
 
 
 @dataclass(frozen=True)
