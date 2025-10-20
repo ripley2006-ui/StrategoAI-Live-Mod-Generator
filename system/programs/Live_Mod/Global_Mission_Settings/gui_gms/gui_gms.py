@@ -52,6 +52,8 @@ from ..config_gms.gms_actions import (
     write_ini_values,
     read_keys_with_comment_state,
     write_keys_with_comment_state,
+    remove_all_traps_action,
+    remove_all_bombs_action,
     _work_ini_path as _resolve_work_ini_path,
 )
 
@@ -113,6 +115,7 @@ class GlobalMissionSettingsApp:
             "button_blue": "#1e3a8a",  # Matching footer blue
             "button_red": "#b91c1c",
             "button_orange": "#f97316",
+            "button_purple": "#4c1d95",  # Purple matching footer snapshot button
             "button_gray": "#4b5563",
             "button_text": "#f8fafc",
             "tree_bg": "#2b2f37",
@@ -315,6 +318,18 @@ class GlobalMissionSettingsApp:
                 ("Segoe UI", 13, "bold"),
                 ("Arial", 13, "bold"),
             )
+        # Extra large bold font for search field (better readability)
+        try:
+            self.fonts["search"] = tkfont.Font(family="Arial", size=16, weight="bold")
+        except Exception:
+            try:
+                self.fonts["search"] = tkfont.Font(family="Segoe UI", size=16, weight="bold")
+            except Exception:
+                self.fonts["search"] = self._create_font(
+                    ("Arial", 16, "bold"),
+                    ("Segoe UI", 16, "bold"),
+                    ("Verdana", 16, "bold"),
+                )
         self.fonts["header"] = self._create_font(
             ("Arial Narrow", 11, "bold"),
             ("Segoe UI", 11, "bold"),
@@ -409,6 +424,7 @@ class GlobalMissionSettingsApp:
             "button_blue": "#1e3a8a",    # darker blue (matching footer blue)
             "button_red": "#7f1d1d",     # darker red (matching footer dark red)
             "button_orange": "#c2410c",  # darker orange
+            "button_purple": "#3b0f7a",  # darker purple (pressed state)
             "button_gray": "#374151",    # darker gray
         }
         
@@ -417,6 +433,7 @@ class GlobalMissionSettingsApp:
             ("button_blue", "GMS.Blue.TButton"),
             ("button_red", "GMS.Red.TButton"),
             ("button_orange", "GMS.Orange.TButton"),
+            ("button_purple", "GMS.Purple.TButton"),
             ("button_gray", "GMS.Gray.TButton"),
         ):
             self.style.configure(
@@ -536,6 +553,10 @@ class GlobalMissionSettingsApp:
         large_entry_style = dict(entry_style)
         large_entry_style["font"] = self.fonts["entry_large"]
         self.style.configure("GMS.Large.TEntry", **large_entry_style)
+        # Search entry style with extra large, bold font for better readability
+        search_entry_style = dict(entry_style)
+        search_entry_style["font"] = self.fonts["search"]
+        self.style.configure("GMS.Search.TEntry", **search_entry_style)
         combo_style = dict(entry_style)
         combo_style["font"] = self.fonts["button"]
         self.style.configure("GMS.TCombobox", **combo_style)
@@ -1044,14 +1065,14 @@ class GlobalMissionSettingsApp:
         search_label = ttk.Label(parent, text="Search parameter...", style="GMS.Section.TLabel")
         search_label.grid(row=2, column=0, sticky="w", pady=(6, 2))
 
-        # Search field container (38% entry + 10% clear button = 48% total, rest is space)
+        # Search field container with search entry and action buttons
         search_container = ttk.Frame(parent, style="GMS.TFrame")
         search_container.grid(row=3, column=0, sticky="ew", pady=(0, 10))
-        search_container.columnconfigure(0, weight=38)  # 38% for entry (reduced from 45%)
-        search_container.columnconfigure(1, weight=62)  # 62% remaining space
+        search_container.columnconfigure(0, weight=1)  # Search entry takes remaining space
+        # Buttons have fixed widths, no weight
 
-        search_entry = ttk.Entry(search_container, textvariable=self.search_var, style="GMS.TEntry")
-        search_entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        search_entry = ttk.Entry(search_container, textvariable=self.search_var, style="GMS.Search.TEntry", font=self.fonts["body"])
+        search_entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))  # Keep close to Clear button
         # Keep a reference so other handlers (e.g., Notes Enter) can focus it
         try:
             self.search_entry = search_entry
@@ -1074,7 +1095,85 @@ class GlobalMissionSettingsApp:
             command=_clear_search,
             width=8
         )
-        clear_btn.grid(row=0, column=1, sticky="w")
+        clear_btn.grid(row=0, column=1, sticky="w", padx=(0, 24))  # Increased spacing before Remove Traps
+
+        # Remove Traps button
+        def _remove_traps():
+            resp = ask_yes_cancel(
+                "Do you want to remove traps in all missions (set MaxTraps=0)?",
+                parent=self.root
+            )
+            if resp is True:
+                try:
+                    remove_all_traps_action()
+                    # Small delay to ensure file is written before reading
+                    import time
+                    time.sleep(0.2)
+                    # Clear all cached data completely
+                    self.all_entries = []
+                    self.filtered_entries = []
+                    self.entry_index_map = {}
+                    self.category_positions = {}
+                    # Rebuild entries from work.ini to get fresh values
+                    self._try_build_entries_from_work_global()
+                    # Reset to first page and clear category filter
+                    self.page_index = 0
+                    self._set_active_category(None)
+                    # Refresh the view to show updated values
+                    self._refresh_parameter_view()
+                    # Re-select first row
+                    self._auto_select_first_row()
+                    show_info("All traps removed successfully.", parent=self.root)
+                except Exception as e:
+                    show_error(f"Failed to remove traps: {e}", parent=self.root)
+
+        remove_traps_btn = ttk.Button(
+            search_container,
+            text="Remove Traps",
+            style="GMS.Red.TButton",
+            command=_remove_traps,
+            width=14
+        )
+        remove_traps_btn.grid(row=0, column=2, sticky="w", padx=(0, 4))
+
+        # Remove Bombs button
+        def _remove_bombs():
+            resp = ask_yes_cancel(
+                "Do you want to remove bombs in all missions (set MaxBombs=0)?",
+                parent=self.root
+            )
+            if resp is True:
+                try:
+                    remove_all_bombs_action()
+                    # Small delay to ensure file is written before reading
+                    import time
+                    time.sleep(0.2)
+                    # Clear all cached data completely
+                    self.all_entries = []
+                    self.filtered_entries = []
+                    self.entry_index_map = {}
+                    self.category_positions = {}
+                    # Rebuild entries from work.ini to get fresh values
+                    self._try_build_entries_from_work_global()
+                    # Reset to first page and clear category filter
+                    self.page_index = 0
+                    self._set_active_category(None)
+                    # Refresh the view to show updated values
+                    self._refresh_parameter_view()
+                    # Re-select first row
+                    self._auto_select_first_row()
+                    show_info("All bombs removed successfully.", parent=self.root)
+                except Exception as e:
+                    show_error(f"Failed to remove bombs: {e}", parent=self.root)
+
+        remove_bombs_btn = ttk.Button(
+            search_container,
+            text="Remove Bombs",
+            style="GMS.Purple.TButton",
+            command=_remove_bombs,
+            width=14
+        )
+        remove_bombs_btn.grid(row=0, column=3, sticky="w")
 
         help_box = tk.Text(
             parent,
@@ -1112,7 +1211,23 @@ class GlobalMissionSettingsApp:
             entries = [e for e in entries if e.category == self.active_category]
         if not query:
             return list(entries)
-        return [entry for entry in entries if query in entry.label.lower()]
+        # Search in both display label (with spaces) and INI key (without spaces)
+        results = []
+        for entry in entries:
+            # Check display label (e.g., "Max Traps")
+            if query in entry.label.lower():
+                results.append(entry)
+                continue
+            # Check INI key (e.g., "MaxTraps")
+            ini_key = getattr(entry, 'ini_key', None)
+            if ini_key and query in ini_key.lower():
+                results.append(entry)
+                continue
+            # Fallback: check label without spaces (e.g., "MaxTraps" matches "Max Traps")
+            label_no_spaces = entry.label.replace(" ", "").lower()
+            if query in label_no_spaces:
+                results.append(entry)
+        return results
 
     # ------------------------------------------------------------------
     # Event handlers
@@ -2240,6 +2355,8 @@ class GlobalMissionSettingsApp:
         except Exception:
             pass
         entry.insert(0, current)
+        # Select all text so user can immediately type to replace
+        entry.select_range(0, tk.END)
         entry.icursor(tk.END)
         try:
             entry.focus_set()

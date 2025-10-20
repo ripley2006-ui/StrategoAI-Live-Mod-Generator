@@ -24,6 +24,9 @@ from tkinter import messagebox
 try:
     import system.programs.live_Mod.Mission_settings_tab
     import system.programs.live_Mod.Optional_settings_tab
+    # Juke Box Programme
+    import system.programs.Juke_Box.mod_juggler.juggler_gui.juggler_gui
+    import system.programs.Juke_Box.mod_converter.converter_gui.converter_gui
     # Weitere Sub-Tab Module hier hinzufügen, falls vorhanden
 except ImportError:
     pass  # Falls Module fehlen, trotzdem weitermachen

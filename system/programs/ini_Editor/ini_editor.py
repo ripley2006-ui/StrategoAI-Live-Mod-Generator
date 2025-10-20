@@ -9,6 +9,12 @@ from tkinter import filedialog, messagebox, scrolledtext
 from pathlib import Path
 import re
 
+# Import event bus for notifying other UIs when work.ini is saved
+try:
+    from system.gui_utils import event_bus as _event_bus  # type: ignore
+except Exception:
+    _event_bus = None  # type: ignore
+
 
 def default_work_ini_path() -> str:
     """Return the default work.ini path in user's AppData."""
@@ -252,12 +258,22 @@ class IniEditorWindow:
         selection = self.sections_list.curselection()
         if not selection:
             return
-        
+
         idx = selection[0]
         if hasattr(self, '_section_lines') and idx in self._section_lines:
             line_num = self._section_lines[idx]
             self.text_editor.mark_set(tk.INSERT, f"{line_num}.0")
-            self.text_editor.see(tk.INSERT)
+            # Position section header at top of view instead of center
+            try:
+                total_lines = int(self.text_editor.index(tk.END).split('.')[0]) - 1
+                if total_lines > 0:
+                    # Scroll so the section line is at the top of the view
+                    fraction = (line_num - 1) / float(total_lines)
+                    self.text_editor.yview_moveto(fraction)
+                else:
+                    self.text_editor.see(f"{line_num}.0")
+            except Exception:
+                self.text_editor.see(f"{line_num}.0")
             self.text_editor.focus_set()
     
     def _apply_syntax_highlighting(self):
@@ -469,19 +485,29 @@ class IniEditorWindow:
         """Save the current file."""
         if not self.filepath:
             return self._on_save_as()
-        
+
         try:
             content = self.text_editor.get("1.0", tk.END)
             # Remove the extra newline that Tkinter adds
             if content.endswith('\n'):
                 content = content[:-1]
-            
+
             with open(self.filepath, "w", encoding="utf-8") as f:
                 f.write(content)
-            
+
             self.baseline_text = content
             self.dirty = False
             self.text_editor.edit_modified(False)
+
+            # Publish events to notify other UIs that work.ini has changed
+            try:
+                if _event_bus is not None:
+                    _event_bus.publish("work_ini_changed")
+                    # Also publish reset event to force full rebuild in all tabs
+                    _event_bus.publish("work_ini_reset")
+            except Exception:
+                pass
+
             return True
         except Exception as e:
             messagebox.showerror("Save Failed", f"Cannot write file:\n{self.filepath}\n\n{e}")

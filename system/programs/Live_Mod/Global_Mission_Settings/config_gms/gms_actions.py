@@ -694,6 +694,8 @@ __all__ = [
     "validate_template_format",
     "load_template",
     "get_user_ui_info_from_mirror",
+    "remove_all_traps_action",
+    "remove_all_bombs_action",
 ]
 
 # ---------------------- Difficulty helpers (minimal, safe) -------------------
@@ -1670,3 +1672,77 @@ def load_template(template_name: str) -> tuple[bool, str]:
         except Exception:
             pass
         return (False, f"Failed to load template: {str(e)}")
+
+
+# ---------------------------------------------------------------------------
+# Remove all traps/bombs helpers
+# ---------------------------------------------------------------------------
+
+def remove_all_parameter_values(parameter_key: str, new_value: str = "0") -> None:
+    """Set all occurrences of a parameter to a specific value in the entire work.ini.
+
+    This function replaces ALL occurrences of the parameter throughout the entire INI file,
+    not just in the [Global] section. Useful for removing traps/bombs from all missions.
+
+    Args:
+        parameter_key: The INI key to modify (e.g., "MaxTraps", "MaxBombs")
+        new_value: The new value to set (default: "0")
+    """
+    work_path = _work_ini_path()
+    if not work_path.exists():
+        return
+
+    text = _read_text(work_path)
+    if not text:
+        return
+
+    # Detect newline style
+    newline = "\r\n" if "\r\n" in text else "\n"
+    lines = text.splitlines(keepends=True)
+
+    # Build regex pattern to match the parameter line
+    # Captures: (prefix)(key)(sep)(value)(eol)
+    pattern = re.compile(
+        rf"^(?P<prefix>\s*)(?P<key>{re.escape(parameter_key)})"
+        rf"(?P<sep>\s*=\s*)(?P<val>.*?)(?P<eol>(\r\n|\n|\r)?)$",
+        re.IGNORECASE,
+    )
+
+    # Replace all matching lines
+    modified = False
+    for i, line in enumerate(lines):
+        # Skip commented lines
+        if line.lstrip().startswith((';', '#')):
+            continue
+
+        m = pattern.match(line)
+        if m:
+            # Preserve formatting (prefix, separator, EOL)
+            prefix = m.group('prefix')
+            key = m.group('key')
+            separator = m.group('sep')
+            eol = m.group('eol') if m.group('eol') else newline
+            lines[i] = f"{prefix}{key}{separator}{new_value}{eol}"
+            modified = True
+
+    if modified:
+        updated_text = "".join(lines)
+        _write_text(work_path, updated_text)
+        # Publish BOTH events to ensure all tabs refresh
+        _publish_work_ini_changed()
+        # Also publish reset event to force full rebuild in all tabs
+        try:
+            if _event_bus is not None:
+                _event_bus.publish("work_ini_reset")
+        except Exception:
+            pass
+
+
+def remove_all_traps_action() -> None:
+    """Remove all traps from all missions by setting MaxTraps=0 everywhere."""
+    remove_all_parameter_values("MaxTraps", "0")
+
+
+def remove_all_bombs_action() -> None:
+    """Remove all bombs from all missions by setting MaxBombs=0 everywhere."""
+    remove_all_parameter_values("MaxBombs", "0")
